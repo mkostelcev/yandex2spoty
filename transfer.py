@@ -21,6 +21,7 @@ import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
+import requests
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 from yandex_music import Client as YandexClient
@@ -33,6 +34,29 @@ SPOTIFY_CACHE = HERE / ".spotify_token_cache"
 MATCH_THRESHOLD = 0.75
 LIKE_BATCH = 50
 FETCH_BATCH = 100
+PAUSE = 0.2  # между запросами к Spotify
+
+
+class DailyCap(Exception):
+    """Выбрана суточная квота приложения (429 с Retry-After в часах)."""
+
+    def __init__(self, retry_after: int):
+        self.retry_after = retry_after
+
+
+def sp_call(fn, *args, **kwargs):
+    """Вызов Spotify API: короткие 429 ретраим сами, суточные - наверх."""
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except spotipy.SpotifyException as e:
+            if e.http_status != 429:
+                raise
+            # без заголовка Retry-After считаем, что это суточная квота
+            retry_after = int((e.headers or {}).get("Retry-After", "999999"))
+            if retry_after > 120:
+                raise DailyCap(retry_after)
+            time.sleep(retry_after + 1)
 
 
 def norm(s: str) -> str:
@@ -103,10 +127,7 @@ def search_spotify(sp: spotipy.Spotify, title: str, artists: list[str], dur_ms):
     ]
     best_id, best_score = None, 0.0
     for q in queries:
-        try:
-            res = sp.search(q=q, type="track", limit=5)
-        except spotipy.SpotifyException:
-            continue
+        res = sp_call(sp.search, q=q, type="track", limit=5)
         for cand in res["tracks"]["items"]:
             score = score_candidate(cand, title, artists, dur_ms)
             if score > best_score:
@@ -120,11 +141,11 @@ def search_spotify(sp: spotipy.Spotify, title: str, artists: list[str], dur_ms):
 
 def fetch_existing_spotify_likes(sp: spotipy.Spotify) -> set:
     ids = set()
-    page = sp.current_user_saved_tracks(limit=50)
+    page = sp_call(sp.current_user_saved_tracks, limit=50)
     while page:
         ids.update(i["track"]["id"] for i in page["items"] if i["track"])
         print(f"  уже лайкнуто в Spotify: {len(ids)}", end="\r")
-        page = sp.next(page) if page["next"] else None
+        page = sp_call(sp.next, page) if page["next"] else None
     print()
     return ids
 
@@ -161,7 +182,9 @@ def main():
             cache_path=str(SPOTIFY_CACHE),
             open_browser=not args.no_browser,
         ),
-        retries=5,
+        # чистая сессия без retry-адаптера: 429 обрабатываем сами в sp_call,
+        # иначе urllib3 съедает Retry-After (или спит по нему сутки)
+        requests_session=requests.Session(),
     )
     me = sp.current_user()
     print(f"Spotify: залогинен как {me['display_name']} ({me['id']})")
@@ -172,59 +195,72 @@ def main():
         tracks = tracks[: args.limit]
 
     state = load_state()
-    pending_ids = []
+    pending = []  # [(yandex_key, spotify_id)] - сматчено, но ещё не лайкнуто
     misses = []
     done = matched = 0
 
     def flush_likes():
         # по одному треку на запрос: при пачке все получают одинаковый
         # timestamp и Spotify перемешивает их внутри пачки
-        if not args.dry_run:
-            for tid in pending_ids:
-                sp.current_user_saved_tracks_add([tid])
-                time.sleep(0.05)
-            save_state(state)  # в dry-run состояние не пишем
-        pending_ids.clear()
+        if args.dry_run:
+            pending.clear()
+            return
+        while pending:
+            _, tid = pending[0]
+            sp_call(sp.current_user_saved_tracks_add, [tid])
+            pending.pop(0)
+            time.sleep(PAUSE)
+        save_state(state)  # в dry-run состояние не пишем
 
-    for tr in tracks:
-        done += 1
-        if tr is None:
-            continue
-        key = str(tr.track_id)
-        if key in state and state[key] != "MISS":
-            continue  # ненайденные (MISS) пробуем снова - матчинг мог улучшиться
-        title = tr.title or ""
-        artists = tr.artists_name() or []
-        label = f"{', '.join(artists)} - {title}"
-        if not title:
-            state[key] = "MISS"
-            misses.append((label, "нет метаданных"))
-            continue
-        # подкасты/аудиокниги из лайков не переносим
-        if not artists or (tr.type and tr.type != "music"):
-            state[key] = "SKIP_NOT_MUSIC"
-            print(f"[{done}/{len(tracks)}] ~ {label}  (подкаст, пропущен)")
-            continue
+    capped = None
+    try:
+        for tr in tracks:
+            done += 1
+            if tr is None:
+                continue
+            key = str(tr.track_id)
+            if key in state and state[key] != "MISS":
+                continue  # ненайденные (MISS) пробуем снова - матчинг мог улучшиться
+            title = tr.title or ""
+            artists = tr.artists_name() or []
+            label = f"{', '.join(artists)} - {title}"
+            if not title:
+                state[key] = "MISS"
+                misses.append((label, "нет метаданных"))
+                continue
+            # подкасты/аудиокниги из лайков не переносим
+            if not artists or (tr.type and tr.type != "music"):
+                state[key] = "SKIP_NOT_MUSIC"
+                print(f"[{done}/{len(tracks)}] ~ {label}  (подкаст, пропущен)")
+                continue
 
-        sp_id, score = search_spotify(sp, title, artists, tr.duration_ms)
-        if sp_id:
-            matched += 1
-            state[key] = sp_id
-            if sp_id in already_liked:
-                print(f"[{done}/{len(tracks)}] = {label}  (уже в лайках)")
+            sp_id, score = search_spotify(sp, title, artists, tr.duration_ms)
+            if sp_id:
+                matched += 1
+                state[key] = sp_id
+                if sp_id in already_liked:
+                    print(f"[{done}/{len(tracks)}] = {label}  (уже в лайках)")
+                else:
+                    already_liked.add(sp_id)
+                    pending.append((key, sp_id))
+                    print(f"[{done}/{len(tracks)}] + {label}  ({score:.2f})")
+                    if len(pending) >= LIKE_BATCH:
+                        flush_likes()
             else:
-                already_liked.add(sp_id)
-                pending_ids.append(sp_id)
-                print(f"[{done}/{len(tracks)}] + {label}  ({score:.2f})")
-                if len(pending_ids) >= LIKE_BATCH:
-                    flush_likes()
-        else:
-            state[key] = "MISS"
-            misses.append((label, f"лучший скор {score:.2f}"))
-            print(f"[{done}/{len(tracks)}] ? {label}  НЕ НАЙДЕН")
-        time.sleep(0.1)  # чтобы не упираться в rate limit поиска
+                state[key] = "MISS"
+                misses.append((label, f"лучший скор {score:.2f}"))
+                print(f"[{done}/{len(tracks)}] ? {label}  НЕ НАЙДЕН")
+            time.sleep(PAUSE)  # чтобы не упираться в rate limit поиска
 
-    flush_likes()
+        flush_likes()
+    except DailyCap as e:
+        capped = e
+        # сматченные, но не лайкнутые треки убираем из state,
+        # чтобы следующий запуск обработал их заново
+        for k, _ in pending:
+            state.pop(k, None)
+        if not args.dry_run:
+            save_state(state)
 
     if misses:
         with UNMATCHED_FILE.open("w", newline="") as f:
@@ -233,6 +269,14 @@ def main():
                 w.writerow(row)
 
     total_missed = sum(1 for v in state.values() if v == "MISS")
+    if capped:
+        hours = capped.retry_after / 3600
+        print(
+            f"\nСуточная квота Spotify исчерпана (Retry-After {capped.retry_after} с, "
+            f"~{hours:.1f} ч). Прогресс сохранён: {len(state)} записей. "
+            f"Перезапусти скрипт после сброса квоты - продолжит с этого места."
+        )
+        sys.exit(2)
     print(
         f"\nГотово. Обработано {done}, найдено в этот заход {matched}, "
         f"не найдено всего {total_missed} (см. unmatched.csv)."
