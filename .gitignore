@@ -1,0 +1,6 @@
+.env
+.spotify_token_cache
+state.json
+unmatched.csv
+__pycache__/
+*.pyc
