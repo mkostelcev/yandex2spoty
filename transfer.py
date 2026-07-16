@@ -251,6 +251,12 @@ def main():
                 misses.append((label, f"лучший скор {score:.2f}"))
                 print(f"[{done}/{len(tracks)}] ? {label}  НЕ НАЙДЕН")
             time.sleep(PAUSE)  # чтобы не упираться в rate limit поиска
+            # периодически сохраняем прогресс (кроме ещё не лайкнутых),
+            # чтобы аварийная остановка не тратила квоту на перепроверку
+            if done % 25 == 0 and not args.dry_run:
+                pending_keys = {k for k, _ in pending}
+                snap = {k: v for k, v in state.items() if k not in pending_keys}
+                STATE_FILE.write_text(json.dumps(snap, ensure_ascii=False, indent=0))
 
         flush_likes()
     except DailyCap as e:
