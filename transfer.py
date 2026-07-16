@@ -45,18 +45,34 @@ class DailyCap(Exception):
 
 
 def sp_call(fn, *args, **kwargs):
-    """Вызов Spotify API: короткие 429 ретраим сами, суточные - наверх."""
+    """Вызов Spotify API: короткие 429 и временные сбои ретраим сами,
+    суточную квоту - наверх через DailyCap."""
+    transient = 0
     while True:
         try:
             return fn(*args, **kwargs)
         except spotipy.SpotifyException as e:
-            if e.http_status != 429:
+            if e.http_status == 429:
+                # без заголовка Retry-After считаем, что это суточная квота
+                retry_after = int((e.headers or {}).get("Retry-After", "999999"))
+                if retry_after > 120:
+                    raise DailyCap(retry_after)
+                time.sleep(retry_after + 1)
+                continue
+            # 5xx (типа "no healthy upstream") бывают у Spotify пачками
+            if e.http_status and e.http_status >= 500 and transient < 5:
+                transient += 1
+                print(f"  ...{e.http_status} от API, ретрай через {10 * transient} с")
+                time.sleep(10 * transient)
+                continue
+            raise
+        except requests.exceptions.RequestException:
+            # сетевая ошибка (моргнул VPN и т.п.)
+            if transient >= 5:
                 raise
-            # без заголовка Retry-After считаем, что это суточная квота
-            retry_after = int((e.headers or {}).get("Retry-After", "999999"))
-            if retry_after > 120:
-                raise DailyCap(retry_after)
-            time.sleep(retry_after + 1)
+            transient += 1
+            print(f"  ...сетевая ошибка, ретрай через {10 * transient} с")
+            time.sleep(10 * transient)
 
 
 def norm(s: str) -> str:
