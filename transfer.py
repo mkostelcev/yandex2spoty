@@ -186,6 +186,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="только матчинг, без добавления лайков")
     ap.add_argument("--limit", type=int, default=0, help="обработать только N треков (для проверки)")
     ap.add_argument("--no-browser", action="store_true", help="не открывать браузер для OAuth (для докера)")
+    ap.add_argument("--retry-misses", action="store_true", help="перепроверить ранее ненайденные треки")
     args = ap.parse_args()
 
     yandex_token = os.environ.get("YANDEX_TOKEN")
@@ -235,8 +236,8 @@ def main():
             if tr is None:
                 continue
             key = str(tr.track_id)
-            if key in state and state[key] != "MISS":
-                continue  # ненайденные (MISS) пробуем снова - матчинг мог улучшиться
+            if key in state and (state[key] != "MISS" or not args.retry_misses):
+                continue  # MISS перепроверяем только по флагу, бережём квоту
             title = tr.title or ""
             artists = tr.artists_name() or []
             label = f"{', '.join(artists)} - {title}"
